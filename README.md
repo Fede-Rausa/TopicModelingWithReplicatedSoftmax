@@ -21,6 +21,6 @@ The code is inspired from these repositories:
 | standard RSM                | https://github.com/fylance/rsm                                             |
 | over-RSM                    | https://github.com/dongwookim-ml/RSM                                       |
 | standard RBM                | https://github.com/mr-easy/Restricted-Boltzmann-Machine                    |
-| topic
+| topic modeling framework    | https://github.com/MIND-Lab/OCTIS                                          |
 
 
