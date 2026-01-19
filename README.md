@@ -19,6 +19,7 @@ The code is inspired from these repositories:
 |----------------------------:|----------------------------------------------------------------------------|
 | standard RSM                | https://github.com/wtang0512/Replicated-Softmax-Model                      |
 | standard RSM                | https://github.com/fylance/rsm                                             |
+| standard RSM                | https://github.com/HHruschka/RMS_Estimation                                |
 | over-RSM                    | https://github.com/dongwookim-ml/RSM                                       |
 | standard RBM                | https://github.com/mr-easy/Restricted-Boltzmann-Machine                    |
 | topic modeling framework    | https://github.com/MIND-Lab/OCTIS                                          |

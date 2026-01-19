@@ -1,0 +1,977 @@
+import numpy as np
+from tqdm import tqdm
+import time
+import warnings
+
+
+##############################################################  RSM original class
+
+class RSM_model(object):
+    def __init__(self):
+        self.W = None
+
+        """
+        Parameters (of train function)
+        ----------
+        num_topics : number of topics
+        epochs : number of training epochs
+        btsz : batch size
+        lr : learning rate
+        momentum : momentum of momentum optimizer
+        (applied only if train_optimizer='momentum')
+        rms_decay : decay rate for RMSProp optimizer
+        (applied only if train_optimizer='rmsprop')
+        adam_decay1 : first decay rate for Adam optimizer
+        (applied only if train_optimizer='adam')
+        adam_decay2 : second decay rate for Adam optimizer
+        (applied only if train_optimizer='adam')
+        K : number of Gibbs sampling steps when using KCD
+        decay : penalization coefficient, default 0 (no penalization)
+        penalty_L1 : if True uses L1 penalization, else L2 penalization
+        penalty_local : if True uses local penalization,
+        else global penalization
+        softstart : initialization scale for weights
+        (randomly drawn from N(0,1)*softstart)
+        logdtm : if True each cell of the dtm is transformed as log(1+cell),
+        otherwise the raw counts are used
+        monitor : if True prints training information during training
+
+        cd_type : type of contrastive divergence to use,
+          'kcd', 'pcd', 'mfcd' (default) or 'gradcd' :
+                    'kcd' stands for k-step contrastive divergence
+                    'pcd' stands for persistent contrastive divergence
+                    'mfcd' stands for mean-field contrastive divergence
+                    'gradcd' stands for gradual k-step contrastive divergence,
+                    where k increases over epochs latter when increase_speed is higher
+        train_optimizer : training optimizer to use :
+                    'full' for full batch training,
+                    'sgd' for simple stochastic gradient descent,
+                    'minibatch' for mini-batch training,
+                    'momentum' for mini-batch with momentum,
+                    'rmsprop' for RMSProp optimizer,
+                    'adam' for Adam optimizer,
+                    'adagrad' for Adagrad optimizer
+        """
+
+    def softmax_vec(self, array):
+        exparr = np.exp(array)
+        return exparr / exparr.sum()
+
+    def softmax(self, array):
+        '''
+        x: a numpy matrix, where the softmax activation will be applied by row
+        numerically stable implementation of softmax activation
+        the logarithm of the sum of exponential is approximated using the maximum
+        '''
+        maxs = np.max(array, axis=1, keepdims=True)
+        lse = maxs + np.log(np.sum(np.exp(array - maxs), axis=1, keepdims=True))
+        return np.exp(array - lse)
+
+    def sigmoid(self, x):
+        return 1 / (1 + np.exp(-x))
+
+    ############################## energy and probability
+
+    def neg_energy(self, v, h):
+        w_vh, w_v, w_h = self.W
+        D = v.sum(axis=1)
+        t1 = v @ w_v
+        t2 = D * (h @ w_h)
+        t3 = (v @ w_vh @ h.T).sum(axis=1)
+        en = t1 + t2 + t3
+        return en
+
+    def neg_free_energy(self, v):  # it's equivalent to the log pdf
+        w_vh, w_v, w_h = self.W
+        T = self.hidden
+        D = v.sum(axis=1)
+        fren = np.dot(v, w_v)
+        for j in range(T):
+            w_j = w_vh[:, j]
+            a_j = w_h[j]
+            fren += np.log(1 + np.exp(D * a_j + np.dot(v, w_j)))
+        return fren
+
+    def neg_free_energy_single_doc(self, v):  # it's equivalent to the log pdf
+        w_vh, w_v, w_h = self.W
+        T = self.hidden
+        D = v.sum()
+        fren = np.dot(v, w_v)
+        for j in range(T):
+            w_j = w_vh[:, j]
+            a_j = w_h[j]
+            fren += np.log(1 + np.exp(D * a_j + np.dot(v, w_j)))
+        return fren
+
+    def marginal_pdf(self, v):
+        return np.exp(self.neg_free_energy(v))
+
+    def visible2hidden_vec(self, v):
+        w_vh, w_v, w_h = self.W
+        D = v.sum()
+        energy = D * w_h + np.dot(v, w_vh)
+        return self.sigmoid(energy)
+
+    def visible2hidden(self, v):
+        w_vh, w_v, w_h = self.W
+        D = np.tile(v.sum(axis=1), (w_h.shape[0], 1)).T
+        energy = D * w_h + np.dot(v, w_vh)
+        return self.sigmoid(energy)
+
+    def hidden2visible_vec(self, h):
+        w_vh, w_v, w_h = self.W
+        energy = w_v + np.dot(w_vh, h)
+        return self.softmax_vec(energy)
+
+    def hidden2visible(self, h):
+        w_vh, w_v, w_h = self.W
+        energy = np.tile(w_v, (h.shape[0], 1)).T + np.dot(w_vh, h.T)
+        return self.softmax(energy.T)
+
+    def topic_words(self, topk, id2word=None):
+        w_vh, w_v, w_h = self.W
+        T = self.hidden
+        if id2word is None:
+            id2word = self.id2word
+        words = np.array([k for k in id2word.token2id.keys()])
+
+        toplist = []
+        for t in range(T):
+            topw = w_vh[:, t]
+            bestwords = words[np.argsort(topw)[::-1]][0:topk]
+            toplist.append(bestwords)
+
+        return toplist
+
+    def _get_topic_word_matrix(self):
+        """
+        Return the topic representation of the words
+        """
+        w_vh, w_v, w_h = self.W
+        topic_word_matrix = w_vh.T
+        normalized = []
+        for words_w in topic_word_matrix:
+            minimum = min(words_w)
+            words = words_w - minimum
+            normalized.append([float(i) / sum(words) for i in words])
+        topic_word_matrix = np.array(normalized)
+        return topic_word_matrix
+
+    def _get_topic_word_matrix0(self):
+        """
+        Return the topic representation of the words
+        """
+        w_vh, w_v, w_h = self.W
+        topic_word_matrix = np.empty(w_vh.T.shape)
+        for t in range(w_vh.T.shape[0]):
+            topic_word_matrix[t, :] = self.softmax_vec(w_vh.T[t, :] - w_v)
+        return topic_word_matrix
+
+    def _get_topic_doc(self, dtm):
+        return self.visible2hidden(dtm).T
+
+    def _get_topics(self, topk):
+        w_vh, w_v, w_h = self.W
+        T = self.hidden
+        words = np.array([k for k in self.id2word.token2id.keys()])
+
+        toplist = []
+        for t in range(T):
+            topw = w_vh[:, t]
+            bestwords = words[np.argsort(topw)[::-1]][0:topk]
+            toplist.append(bestwords)
+
+        return toplist
+
+        # topics_output = []
+        # for topic in result["topic-word-matrix"]:
+        #     top_k = np.argsort(topic)[-top_words:]
+        #     top_k_words = list(reversed([self.id2word[i] for i in top_k]))
+        #     topics_output.append(top_k_words)
+
+    ##################################### leapfrog trainsition operators
+
+    def multinomial_sample(self, probs, N):
+        return np.random.multinomial(N, probs, size=1)[0]
+
+    def unif_reject_sample(self, probs):
+        h_unif = np.random.rand(*probs.shape)
+        h_sample = np.array(h_unif < probs, dtype=int)
+        return h_sample
+
+    def deterministic_sample(self, probs):
+        return (probs > 0.5).astype(int)
+
+    def gibbs_transition(self, v):
+        D = v.sum(axis=1)
+        hidden_probs = self.visible2hidden(v)
+        hidden_sample = self.unif_reject_sample(hidden_probs)
+        visible_probs = self.hidden2visible(hidden_sample)
+        visible_sample = np.empty(v.shape)
+        for i in range(v.shape[0]):
+            visible_sample[i] = self.multinomial_sample(visible_probs[i], D[i])
+        return visible_sample
+
+    def MH_transition(self, state, logpdf):
+        new = self.gibbs_transition(state)
+        old_logpdf = logpdf(state)
+        new_logpdf = logpdf(new)
+
+        accept_ratio = min(1, np.exp(new_logpdf - old_logpdf))
+
+        # Accept or reject
+        if np.random.random() < accept_ratio:
+            return new
+        else:
+            return state
+
+    #### leapfrog for single document vectors (useful for ais estimates of perplexity)
+
+    def gibbs_transition_vec(self, v):
+        D = v.sum()
+        hidden_probs = self.visible2hidden_vec(v)
+        hidden_sample = self.unif_reject_sample(hidden_probs)
+        visible_probs = self.hidden2visible_vec(hidden_sample)
+        visible_sample = self.multinomial_sample(visible_probs, D)
+        return visible_sample
+
+    def MH_transition_vec(self, state, logpdf):
+        new = self.gibbs_transition_vec(state)
+        old_logpdf = logpdf(state)
+        new_logpdf = logpdf(new)
+
+        accept_ratio = min(1, np.exp(new_logpdf - old_logpdf))
+
+        # Accept or reject
+        if np.random.random() < accept_ratio:
+            return new
+        else:
+            return state
+
+    ################################## gradient descent optimization
+
+    def interaction_penalty(self, vel_vh, w_vh):
+        if self.penalty:
+            if self.penL1:  # L1 penalty
+                if self.local_penalty:
+                    penal = self.decay * np.sign(w_vh)
+                else:
+                    penal = self.decay * np.sum(np.abs(w_vh)) * np.sign(w_vh)
+            else:  # L2 penalty
+                if self.local_penalty:
+                    penal = self.decay * w_vh
+                else:
+                    penal = self.decay * np.sum(w_vh)
+
+            vel_vh = vel_vh - penal
+        return vel_vh
+
+    def gradient_simple(self, v1, v2, h1, h2):
+        w_vh, w_v, w_h = self.W
+        lr = self.lr
+
+        vel_vh = np.dot(v1.T, h1) - np.dot(v2.T, h2)
+        vel_vh = self.interaction_penalty(vel_vh, w_vh)
+        vel_v = v1.sum(axis=0) - v2.sum(axis=0)
+        vel_h = h1.sum(axis=0) - h2.sum(axis=0)
+
+        w_vh += vel_vh * lr
+        w_v += vel_v * lr
+        w_h += vel_h * lr
+
+        if any(
+            (np.any(np.isnan(w_vh)), np.any(np.isnan(w_v)), np.any(np.isnan(w_h)))
+        ):
+            self.stop = True
+            warnings.warn("NaN values founded in weights: stopping training")
+        else:
+            self.W = w_vh, w_v, w_h
+
+    def gradient_momentum(self, v1, v2, h1, h2):
+        w_vh, w_v, w_h = self.W
+        vel_vh, vel_v, vel_h = self.train_cache
+        m = self.momentum
+        lr = self.lr
+
+        vel_vh = vel_vh * m + (np.dot(v1.T, h1) - np.dot(v2.T, h2)) * (1 - m)
+        vel_vh = self.interaction_penalty(vel_vh, w_vh)
+        vel_v = vel_v * m + (v1.sum(axis=0) - v2.sum(axis=0)) * (1 - m)
+        vel_h = vel_h * m + (h1.sum(axis=0) - h2.sum(axis=0)) * (1 - m)
+
+        w_vh += vel_vh * lr
+        w_v += vel_v * lr
+        w_h += vel_h * lr
+
+        if any(
+            (np.any(np.isnan(w_vh)), np.any(np.isnan(w_v)), np.any(np.isnan(w_h)))
+        ):
+            self.stop = True
+            warnings.warn("NaN values founded in weights: stopping training")
+        else:
+            self.W = w_vh, w_v, w_h
+
+        self.train_cache = vel_vh, vel_v, vel_h
+
+    def gradient_adagrad(self, v1, v2, h1, h2):
+        w_vh, w_v, w_h = self.W
+        vel_vh, vel_v, vel_h = self.train_cache
+        lr = self.lr
+
+        vel_vh = np.dot(v1.T, h1) - np.dot(v2.T, h2)
+        vel_vh = self.interaction_penalty(vel_vh, w_vh)
+        vel_v = v1.sum(axis=0) - v2.sum(axis=0)
+        vel_h = h1.sum(axis=0) - h2.sum(axis=0)
+
+        w_vh += vel_vh * lr / (np.sqrt(np.sum(vel_vh**2)) + 1e-8)
+        w_v += vel_v * lr / (np.sqrt(np.sum(vel_v**2)) + 1e-8)
+        w_h += vel_h * lr / (np.sqrt(np.sum(vel_h**2)) + 1e-8)
+
+        if any(
+            (np.any(np.isnan(w_vh)), np.any(np.isnan(w_v)), np.any(np.isnan(w_h)))
+        ):
+            self.stop = True
+            warnings.warn("NaN values founded in weights: stopping training")
+        else:
+            self.W = w_vh, w_v, w_h
+
+        self.train_cache = vel_vh, vel_v, vel_h
+
+    def gradient_rmsprop(self, v1, v2, h1, h2):
+        (
+            w_vh,
+            w_v,
+            w_h,
+        ) = self.W
+        vel_vh, vel_v, vel_h, rms_m2_vh, rms_m2_v, rms_m2_h = self.train_cache
+        rms_decay = self.rms_decay
+        lr = self.lr
+
+        vel_vh = np.dot(v1.T, h1) - np.dot(v2.T, h2)
+        vel_vh = self.interaction_penalty(vel_vh, w_vh)
+        vel_v = v1.sum(axis=0) - v2.sum(axis=0)
+        vel_h = h1.sum(axis=0) - h2.sum(axis=0)
+
+        rms_m2_vh = rms_decay * rms_m2_vh + (1 - rms_decay) * (vel_vh**2)
+        w_vh += lr * vel_vh / np.sqrt(rms_m2_vh + 1e-8)
+        rms_m2_v = rms_decay * rms_m2_v + (1 - rms_decay) * (vel_v**2)
+        w_v += lr * vel_v / np.sqrt(rms_m2_v + 1e-8)
+        rms_m2_h = rms_decay * rms_m2_h + (1 - rms_decay) * (vel_h**2)
+        w_h += lr * vel_h / np.sqrt(rms_m2_h + 1e-8)
+
+        if any(
+            (np.any(np.isnan(w_vh)), np.any(np.isnan(w_v)), np.any(np.isnan(w_h)))
+        ):
+            self.stop = True
+            warnings.warn("NaN values founded in weights: stopping training")
+        else:
+            self.W = w_vh, w_v, w_h
+
+        self.train_cache = vel_vh, vel_v, vel_h, rms_m2_vh, rms_m2_v, rms_m2_h
+
+    def gradient_adam(self, v1, v2, h1, h2):
+        w_vh, w_v, w_h = self.W
+        (
+            vel_vh,
+            vel_v,
+            vel_h,
+            adam_m1_vh,
+            adam_m1_v,
+            adam_m1_h,
+            adam_m2_vh,
+            adam_m2_v,
+            adam_m2_h,
+            t,
+        ) = self.train_cache
+        decay1 = self.adam_decay1
+        decay2 = self.adam_decay2
+        lr = self.lr
+
+        vel_vh = np.dot(v1.T, h1) - np.dot(v2.T, h2)
+        vel_vh = self.interaction_penalty(vel_vh, w_vh)
+        vel_v = v1.sum(axis=0) - v2.sum(axis=0)
+        vel_h = h1.sum(axis=0) - h2.sum(axis=0)
+
+        # Increment t first (should start from 1, not 0)
+        t += 1
+
+        # Compute bias correction terms
+        bias_correction1 = 1 - decay1**t
+        bias_correction2 = 1 - decay2**t
+
+        # Update for w_vh
+        adam_m1_vh = decay1 * adam_m1_vh + (1 - decay1) * vel_vh
+        adam_m2_vh = decay2 * adam_m2_vh + (1 - decay2) * (vel_vh**2)
+        adam_m1_vh_hat = adam_m1_vh / bias_correction1
+        adam_m2_vh_hat = adam_m2_vh / bias_correction2
+        w_vh += lr * adam_m1_vh_hat / (np.sqrt(adam_m2_vh_hat) + 1e-8)
+
+        # Update for w_v
+        adam_m1_v = decay1 * adam_m1_v + (1 - decay1) * vel_v
+        adam_m2_v = decay2 * adam_m2_v + (1 - decay2) * (vel_v**2)
+        adam_m1_v_hat = adam_m1_v / bias_correction1
+        adam_m2_v_hat = adam_m2_v / bias_correction2
+        w_v += lr * adam_m1_v_hat / (np.sqrt(adam_m2_v_hat) + 1e-8)
+
+        # Update for w_h
+        adam_m1_h = decay1 * adam_m1_h + (1 - decay1) * vel_h
+        adam_m2_h = decay2 * adam_m2_h + (1 - decay2) * (vel_h**2)
+        adam_m1_h_hat = adam_m1_h / bias_correction1
+        adam_m2_h_hat = adam_m2_h / bias_correction2
+        w_h += lr * adam_m1_h_hat / (np.sqrt(adam_m2_h_hat) + 1e-8)
+
+        if any(
+            (np.any(np.isnan(w_vh)), np.any(np.isnan(w_v)), np.any(np.isnan(w_h)))
+        ):
+            self.stop = True
+            warnings.warn("NaN values founded in weights: stopping training")
+        else:
+            self.W = w_vh, w_v, w_h
+
+        self.train_cache = (
+            vel_vh,
+            vel_v,
+            vel_h,
+            adam_m1_vh,
+            adam_m1_v,
+            adam_m1_h,
+            adam_m2_vh,
+            adam_m2_v,
+            adam_m2_h,
+            t,
+        )
+
+    ########################################## contrastive divergence steps
+
+    def kcd_step(self, ids):
+        v0 = self.dtm[ids, :]
+        h0 = self.visible2hidden(v0)
+        v1 = v0
+        for k in range(self.tK):
+            v1 = self.gibbs_transition(v1)
+        h1 = self.visible2hidden(v1)
+
+        if not self.mean_h:  # converting probabilities to binaries
+            h0 = self.unif_reject_sample(h0)
+            h1 = self.unif_reject_sample(h1)
+
+        self.gradient_step(v0, v1, h0, h1)
+
+    def mfcd_step(self, ids):
+        v0 = self.dtm[ids, :]
+        D = v0.sum(axis=1)
+        h0 = self.visible2hidden(v0)
+        v1 = self.hidden2visible(h0) * D.reshape(-1, 1)
+        h1 = self.visible2hidden(v1)
+
+        self.gradient_step(v0, v1, h0, h1)
+
+    def gradkcd_step(self, ids):
+        self.tK = self.Kvec[self.t]
+        if self.tK == 0:
+            self.mfcd_step(ids)
+        else:
+            self.kcd_step(ids)
+
+    def pcd_step(self, ids):
+        v0 = self.dtm[ids, :]
+        pv0 = self.persistent_v[ids, :]
+        h0 = self.visible2hidden(v0)
+        pv1 = self.gibbs_transition(pv0)
+        ph1 = self.visible2hidden(pv1)
+        self.persistent_v[ids, :] = pv1
+
+        self.gradient_step(v0, pv1, h0, ph1)
+
+    def gradual_k(self, T, K, g=0):
+        t = np.arange(1, T + 1)
+        k = np.floor((K + 1) * ((t / (T + 1)) ** (1 + g))).astype(int)
+        return k
+
+    ########################################## main training function
+
+    def train(
+        self,
+        dtm,
+        num_topics=5,
+        epochs=3,
+        btsz=100,
+        lr=0.01,
+        momentum=0.5,
+        K=1,
+        decay=0,
+        penalty_L1=False,
+        penalty_local=False,
+        monitor_time=False,
+        monitor_ppl=False,
+        monitor_loglik=False,
+        train_optimizer="sgd",
+        cd_type="mfcd",
+        logdtm=False,
+        rms_decay=0.9,
+        adam_decay1=0.9,
+        adam_decay2=0.999,
+        increase_speed=0,
+        softstart=0.001,
+        winit=None,
+        val_dtm=None,
+        random_state=None,
+        verbose=False,
+    ):
+        ## init global variables
+        if random_state is not None:
+            np.random.seed(random_state)
+
+        doval = val_dtm is not None
+
+        # init structure of the model
+        self.set_structure_from_dtm(
+            winit=winit,
+            softstart=softstart,
+            epochs=epochs,
+            num_topics=num_topics,
+            dtm=dtm,
+            val_dtm=val_dtm,
+            monitor_ppl=monitor_ppl,
+            monitor_loglik=monitor_loglik,
+            monitor_time=monitor_time,
+            logdtm=logdtm,
+        )
+
+        ##init training hyperparams
+        self.set_train_hyper(
+            epochs=epochs,
+            btsz=btsz,
+            lr=lr,
+            momentum=momentum,
+            K=K,
+            decay=decay,
+            penalty_L1=penalty_L1,
+            penalty_local=penalty_local,
+            train_optimizer=train_optimizer,
+            cd_type=cd_type,
+            rms_decay=rms_decay,
+            adam_decay1=adam_decay1,
+            adam_decay2=adam_decay2,
+            increase_speed=increase_speed,
+        )
+
+        ## MAIN TRAIN LOOP
+        print("Training RS model...")
+        for t in tqdm(range(epochs)):
+            if monitor_time:
+                current_time = time.time()
+
+            if self.stop:
+                print("training stopped early")
+                break
+            else:
+                self.train_epoch()
+
+            if monitor_time:
+                elapsed_time = time.time() - current_time
+                self.train_time[t] = elapsed_time
+
+            if monitor_ppl:
+                self.train_ppl[t] = self.log_ppl_approx(dtm)
+
+                if doval:
+                    self.val_ppl[t] = self.log_ppl_approx(val_dtm)
+
+            if monitor_loglik:
+                self.train_loglik[t] = np.mean(self.neg_free_energy(dtm))
+
+                if doval:
+                    self.val_loglik[t] = np.mean(self.neg_free_energy(val_dtm))
+
+    def train_epoch(self):
+        """one epoch of training, with sgd and mini-batches"""
+        start_id = 0
+
+        # if self.sgd:
+        np.random.shuffle(self.obs_ids)  # apply sgd
+        self.dtm = self.dtm[self.obs_ids, :]
+        if self.persist:
+            self.persistent_v = self.persistent_v[self.obs_ids, :]
+
+        for b in range(self.batches):
+            ids = np.arange(start_id, start_id + self.btsz)
+            self.cd_learning_step(ids)
+            start_id += self.btsz
+
+        self.t += 1
+
+    def set_structure_from_dtm(
+        self,
+        winit=None,
+        dtm=None,
+        val_dtm=None,
+        softstart=0.001,
+        num_topics=5,
+        epochs=5,
+        monitor_ppl=False,
+        monitor_time=False,
+        monitor_loglik=False,
+        logdtm=False,
+    ):
+        doval = val_dtm is not None
+
+        if logdtm:
+            self.dtm = np.log(1 + dtm)
+            if doval:
+                self.val_dtm = np.log(1 + val_dtm)
+        else:
+            self.dtm = dtm
+            if doval:
+                self.val_dtm = np.log(1 + val_dtm)
+
+        self.hidden = num_topics
+        N, dictsize = dtm.shape
+        self.visible = dictsize
+
+        self.obs_ids = np.arange(N)
+
+        if winit is not None:
+            ###self.W = winit WRONG: You are referencing the same arrays across runs
+            # defensive copy to avoid sharing mutable numpy arrays across runs
+            try:
+                self.W = tuple(np.array(arr, copy=True) for arr in winit)
+            except Exception:
+                # fallback: keep original if not iterable
+                self.W = winit
+
+        if self.W is None:
+            w_vh = softstart * np.random.randn(dictsize, num_topics)
+            w_v = softstart * np.random.randn(dictsize)
+            w_h = softstart * np.random.randn(num_topics)
+            self.W = w_vh, w_v, w_h
+        else:
+            print("train already available weights")
+            w_vh, w_v, w_h = self.W
+
+        if monitor_time:
+            self.train_time = np.empty(epochs)
+
+        if monitor_ppl:
+            self.train_ppl = np.empty(epochs)
+            if doval:
+                self.val_ppl = np.empty(epochs)
+
+        if monitor_loglik:
+            self.train_loglik = np.empty(epochs)
+            if doval:
+                self.val_loglik = np.empty(epochs)
+
+    def set_train_hyper(
+        self,
+        epochs=3,
+        btsz=100,
+        lr=0.01,
+        momentum=0.9,
+        K=1,
+        decay=0,
+        penalty_L1=False,
+        penalty_local=False,
+        train_optimizer="sgd",
+        cd_type="mfcd",
+        rms_decay=0.9,
+        adam_decay1=0.9,
+        adam_decay2=0.999,
+        increase_speed=0,
+    ):
+        N, dictsize = self.dtm.shape
+        num_topics = self.hidden
+
+        self.stop = False
+        self.momentum = momentum
+        self.lr = lr
+        self.decay = decay
+        self.penalty = decay > 0
+        self.penL1 = penalty_L1
+        self.local_penalty = penalty_local
+
+        self.train_optimizer = train_optimizer
+        self.adam_decay1 = adam_decay1
+        self.adam_decay2 = adam_decay2
+        self.rms_decay = rms_decay
+
+        self.persist = cd_type == "pcd"  # persistent_cd
+        self.mean_field = cd_type == "mfcd"  # mean_field_cd
+        self.gradual = cd_type == "gradcd"  # increase_cd
+
+        self.t = 0  # current epoch
+        self.K = K
+        self.tK = K  # current k
+        self.mean_h = True  # whether to use mean hidden activations or sample them
+
+        self.btsz = btsz
+        self.batches = int(np.floor(N / btsz))
+        # self.sgd = (train_optimizer!='full')
+        # self.bt_correct = (btsz**2)/N    #a bayesian would correct decay for batch size. I'm not a bayesian
+
+        ## initialize k
+        if self.gradual:
+            Kvec = self.gradual_k(T=epochs, K=self.K, g=increase_speed)
+        else:
+            Kvec = np.ones(epochs) * self.K
+        self.Kvec = Kvec.astype(int)
+
+        # Initialize persistent chain - one chain for each document in the dataset
+        # Each persistent visible should have the same document length as corresponding data
+        if self.persist:
+            self.persistent_v = np.zeros((N, dictsize))  # Full dataset size
+            persistent_D = self.dtm.sum(
+                axis=1
+            )  # Document lengths from original data
+
+            # Initialize each document with uniform multinomial of its actual length
+            for i in range(N):
+                if persistent_D[i] > 0:  # Avoid empty documents
+                    self.persistent_v[i] = np.random.multinomial(
+                        persistent_D[i], np.ones(dictsize) / dictsize
+                    )
+
+        # Initialize weights gradients
+        vel_vh = np.zeros((dictsize, num_topics))
+        vel_v = np.zeros((dictsize))
+        vel_h = np.zeros((num_topics))
+
+        if self.train_optimizer == "sgd":
+            self.gradient_step = self.gradient_simple
+        else:
+            if self.train_optimizer == "momentum":
+                self.gradient_step = self.gradient_momentum
+                self.train_cache = vel_vh, vel_v, vel_h
+            else:
+                if self.train_optimizer == "adagrad":
+                    self.gradient_step = self.gradient_adagrad
+                    self.train_cache = vel_vh, vel_v, vel_h
+                else:
+                    if self.train_optimizer == "rmsprop":
+                        self.gradient_step = self.gradient_rmsprop
+                        rms_m2_vh = np.zeros((dictsize, num_topics))
+                        rms_m2_v = np.zeros((dictsize))
+                        rms_m2_h = np.zeros((num_topics))
+                        self.rms_decay = 0.9
+                        self.train_cache = (
+                            vel_vh,
+                            vel_v,
+                            vel_h,
+                            rms_m2_vh,
+                            rms_m2_v,
+                            rms_m2_h,
+                        )
+                    else:
+                        if self.train_optimizer == "adam":
+                            self.gradient_step = self.gradient_adam
+                            adam_m1_vh = np.zeros((dictsize, num_topics))
+                            adam_m1_v = np.zeros((dictsize))
+                            adam_m1_h = np.zeros((num_topics))
+                            adam_m2_vh = np.zeros((dictsize, num_topics))
+                            adam_m2_v = np.zeros((dictsize))
+                            adam_m2_h = np.zeros((num_topics))
+                            t = 1
+                            self.adam_decay1 = 0.9
+                            self.adam_decay2 = 0.999
+                            self.train_cache = (
+                                vel_vh,
+                                vel_v,
+                                vel_h,
+                                adam_m1_vh,
+                                adam_m1_v,
+                                adam_m1_h,
+                                adam_m2_vh,
+                                adam_m2_v,
+                                adam_m2_h,
+                                t,
+                            )
+                        else:
+                            self.gradient_step = self.gradient_simple
+
+        if self.mean_field:
+            self.cd_learning_step = self.mfcd_step  # input is v0
+        else:
+            if self.persist:
+                self.cd_learning_step = (
+                    self.pcd_step
+                )  # input is v0, persistent_v, output is new persistent_v
+            else:
+                if cd_type == "kcd":
+                    self.cd_learning_step = self.kcd_step  # input is v0, K fixed
+                else:  # gradual kcd
+                    if self.gradual:
+                        self.cd_learning_step = (
+                            self.gradkcd_step
+                        )  # input is v0, change K each epoch
+                    else:
+                        self.cd_learning_step = (
+                            self.kcd_step
+                        )  # input is v0, K fixed
+
+    ############ perplexity and probability
+
+    def log_ppl_approx(self, dtm):
+        """
+        return the log perplepxity upper bound
+        given a document term matrix
+        """
+        mfh = self.visible2hidden(dtm)
+        vprob = self.hidden2visible(mfh)
+        lpub = np.exp(-np.nansum(np.log(vprob) * dtm) / np.sum(dtm))
+        return lpub
+
+    def ppl_approx(self, testmatrix):
+        """
+        return the perplepxity upper bound
+        given a document term matrix
+        """
+
+        w_vh, w_v, w_h = self.W
+        D = testmatrix.sum(axis=1)
+
+        # compute hidden activations
+        h = self.sigmoid(np.dot(testmatrix, w_vh) + np.outer(D, w_h))
+
+        # compute visible activations
+        v = np.dot(h, w_vh.T) + w_v
+        pdf = self.softmax(v)
+
+        # compute the per word perplexity
+        z = np.nansum(testmatrix * np.log(pdf))
+        s = np.sum(D)
+        ppl = np.exp(-z / s)
+        return ppl
+
+    def approx_prob(self, dtm):
+        w_vh, w_v, w_h = self.W
+        D = dtm.sum(axis=1)
+        # compute hidden activations
+        h = self.sigmoid(np.dot(dtm, w_vh) + np.outer(D, w_h))
+
+        # compute visible activations
+        v = np.dot(h, w_vh.T) + w_v
+        pdf = self.softmax(v)
+
+        return pdf
+
+    def ppl_exact_ais(
+        self, testmatrix, S=10000, niter=100, MH_steps=0, D=[10, 20, 40, 60]
+    ):
+        """
+        return the exact perplepxity
+        given a document term matrix
+        using Annealed Importance Sampling
+
+        S: number of intermediate distributions
+        niter: number of AIS runs
+        MH_steps: number of MH steps per intermediate distribution (0 means just Gibbs sampling)
+        D: list of document lengths to use for the AIS runs
+        """
+        log_Zb_list = []
+        print("Estimating partition function using AIS...")
+        for d in D:
+            log_Zb, Za, log_avg_ratio, var_log_ratio = self.ais(
+                S=S, niter=niter, D=d, MH_steps=MH_steps
+            )
+            log_Zb_list.append(log_Zb)
+
+        # estimate partition function for each document length
+        slope, intercept = self.simple_linreg(
+            X=np.array(D), Y=np.array(log_Zb_list)
+        )
+
+        N = testmatrix.shape[0]
+        total_loglik = 0
+        print("Computing exact perplexity...")
+        for i in tqdm(range(N)):
+            doc = testmatrix[i].reshape(1, -1)
+            D = int(doc.sum())
+            log_Zb = intercept + slope * D
+            loglik = self.neg_free_energy(doc) - log_Zb
+            total_loglik += loglik
+        avg_loglik = total_loglik / N
+        ppl = np.exp(-avg_loglik)
+        return ppl
+
+    def ais(self, S=1000, niter=100, D=20, MH_steps=0):
+        """
+        Annealed Importance Sampling to estimate the partition function of the RSM
+        S: number of intermediate distributions
+        niter: number of AIS runs
+        D: document length for the AIS runs
+        MH_steps: number of MH steps per intermediate distribution (0 means just Gibbs sampling)
+        """
+
+        T = self.hidden
+        Za = 2**T
+        K = self.visible  # voacb length
+        # inverse temperature values
+        beta = np.arange(start=0, stop=1 + 1 / S, step=1 / S)
+
+        # intermediate pdf
+        def temp_pdf(docvec, b):
+            return np.exp(b * np.log(self.marginal_pdf(docvec)))
+
+        def log_temp_pdf(docvec, b):
+            return b * self.neg_free_energy_single_doc(docvec)
+            # return b*np.log(self.marginal_pdf(docvec))
+
+        log_w_ais_list = np.empty(niter)
+        for it in tqdm(range(niter)):
+            v_sampled = np.random.multinomial(D, np.ones(K) / K, size=1)[0]
+
+            # loop
+            log_w_ais = 0  # w_ais = 1
+            for s in range(S - 1):
+                if MH_steps > 0:
+
+                    def lpd(doc):
+                        return log_temp_pdf(doc, beta[s])
+
+                    for m in range(MH_steps):
+                        v_sampled = self.MH_transition_vec(v_sampled, logpdf=lpd)
+                else:
+                    v_sampled = self.gibbs_transition_vec(v_sampled)
+
+                logratio = log_temp_pdf(v_sampled, beta[s + 1]) - log_temp_pdf(
+                    v_sampled, beta[s]
+                )
+                if not np.isnan(logratio):
+                    log_w_ais = log_w_ais + logratio
+                # ratio = temp_pdf(v_sampled, beta[s+1])/temp_pdf(v_sampled, beta[s])
+                # w_ais = w_ais*ratio
+
+            log_w_ais_list[it] = log_w_ais
+
+        vec = log_w_ais_list - np.log(log_w_ais_list.shape[0])
+        log_avg_ratio = np.max(vec) + np.log(np.sum(np.exp(vec - np.max(vec))))
+
+        var_log_ratio = np.nanvar(log_w_ais_list)
+
+        log_Zb = log_avg_ratio + np.log(Za)
+        # Zb = np.exp(log_Zb)
+
+        return log_Zb, Za, log_avg_ratio, var_log_ratio
+
+    def simple_linreg(self, X, Y):
+        """
+        Simple linear regression to predict Y from X
+        Returns coefficients and intercept
+        """
+        # Calculate means
+        mean_x = np.mean(X)
+        mean_y = np.mean(Y)
+
+        # Calculate standard deviations
+        sd_x = np.std(X, ddof=1)
+        sd_y = np.std(Y, ddof=1)
+
+        # Calculate correlation
+        correlation = np.corrcoef(X, Y)[0, 1]
+
+        # Calculate slope (b1) using the formula: b1 = (correlation * sd_y) / sd_X
+        slope = (correlation * sd_y) / sd_x
+
+        # Calculate intercept (b0) using the formula: b0 = mean_y - slope * mean_X
+        intercept = mean_y - slope * mean_x
+
+        return slope, intercept
