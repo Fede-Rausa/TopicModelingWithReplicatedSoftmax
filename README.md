@@ -1,4 +1,4 @@
-# TopicModelingWithReplicatedSoftmax
+# Topic Modeling with Replicated Softmax
 Thesis project for master. Direct integration with the OCTIS package for topic modeling.
 
 The aim was to implement and optimize the [RSM (Hinton and Salakhutdinov 2009)](https://proceedings.neurips.cc/paper_files/paper/2009/file/31839b036f63806cba3f47b93af8ccb5-Paper.pdf) and the [over-RSM (Hinton, Salakhutdinov and Strivastava 2013)](https://arxiv.org/pdf/1309.6865) topic models.
